@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""
+SystemSentinel MCP Server
+Model Context Protocol (JSON-RPC 2.0 stdio) for sharing SystemSentinel telemetry,
+events, proactive guardian incidents, process management, and voice controls with AI agents.
+"""
+
+import sys
+import os
+import json
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+SENTINEL_DIR = Path.home() / ".systemsentinel"
+SOCKET_PATH = SENTINEL_DIR / "sentinel.sock"
+STATE_PATH = SENTINEL_DIR / "state.json"
+EVENTS_PATH = SENTINEL_DIR / "events.jsonl"
+
+
+def query_sentinel_socket(payload: dict, timeout: float = 1.0) -> dict | None:
+    """Sends a command to the running SystemSentinel app via Unix domain socket."""
+    if not SOCKET_PATH.exists():
+        return None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(str(SOCKET_PATH))
+        data = json.dumps(payload).encode("utf-8")
+        s.sendall(data)
+        s.shutdown(socket.SHUT_WR)
+        
+        chunks = []
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        s.close()
+        raw = b"".join(chunks).decode("utf-8", errors="replace")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def get_fallback_system_metrics() -> dict:
+    """Collects system metrics directly if SystemSentinel app is not running."""
+    metrics = {
+        "cpuUsage": 0.0,
+        "loadAverage": 0.0,
+        "memoryUsagePercent": 0.0,
+        "memoryUsedGB": 0.0,
+        "memoryTotalGB": 0.0,
+        "swapUsedGB": 0.0,
+        "statusTitle": "Normal"
+    }
+
+    # Load average via os.getloadavg()
+    try:
+        load1, load5, load15 = os.getloadavg()
+        metrics["loadAverage"] = round(load1, 2)
+        metrics["load15"] = round(load15, 2)
+    except Exception:
+        pass
+
+    # Total RAM via sysctl
+    try:
+        res = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
+        if res.returncode == 0:
+            mem_bytes = int(res.stdout.strip())
+            metrics["memoryTotalGB"] = round(mem_bytes / (1024 ** 3), 2)
+    except Exception:
+        pass
+
+    # Memory used via vm_stat
+    try:
+        res = subprocess.run(["vm_stat"], capture_output=True, text=True)
+        if res.returncode == 0:
+            lines = res.stdout.splitlines()
+            page_size = 4096
+            for line in lines:
+                if "page size of" in line:
+                    parts = line.split("page size of")
+                    if len(parts) > 1:
+                        page_size = int(parts[1].split()[0])
+            pages_active = 0
+            pages_wired = 0
+            pages_compressed = 0
+            for line in lines:
+                if "Pages active:" in line:
+                    pages_active = int(line.split(":")[1].strip().rstrip("."))
+                elif "Pages wired down:" in line:
+                    pages_wired = int(line.split(":")[1].strip().rstrip("."))
+                elif "Pages occupied by compressor:" in line:
+                    pages_compressed = int(line.split(":")[1].strip().rstrip("."))
+            used_bytes = (pages_active + pages_wired + pages_compressed) * page_size
+            metrics["memoryUsedGB"] = round(used_bytes / (1024 ** 3), 2)
+            if metrics["memoryTotalGB"] > 0:
+                metrics["memoryUsagePercent"] = round((metrics["memoryUsedGB"] / metrics["memoryTotalGB"]) * 100, 1)
+    except Exception:
+        pass
+
+    # Quick CPU sample via top
+    try:
+        res = subprocess.run(["top", "-l", "1", "-n", "0"], capture_output=True, text=True, timeout=2.0)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if "CPU usage:" in line:
+                    # CPU usage: 12.5% user, 8.2% sys, 79.3% idle
+                    parts = line.split("CPU usage:")[1].split(",")
+                    user_str = parts[0].replace("user", "").replace("%", "").strip()
+                    sys_str = parts[1].replace("sys", "").replace("%", "").strip() if len(parts) > 1 else "0"
+                    metrics["cpuUsage"] = round(float(user_str) + float(sys_str), 1)
+                    break
+    except Exception:
+        pass
+
+    if metrics["cpuUsage"] >= 90 or metrics["memoryUsagePercent"] >= 90:
+        metrics["statusTitle"] = "Crítico"
+    elif metrics["cpuUsage"] >= 70 or metrics["memoryUsagePercent"] >= 75:
+        metrics["statusTitle"] = "Atenção"
+
+    return metrics
+
+
+def read_cached_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def read_recent_events(limit: int = 30) -> list:
+    if not EVENTS_PATH.exists():
+        return []
+    try:
+        lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+        events = []
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+                if len(events) >= limit:
+                    break
+            except Exception:
+                continue
+        return events
+    except Exception:
+        return []
+
+
+def execute_falar(message: str) -> bool:
+    falar_paths = [
+        "/Users/andrerds/bin/falar",
+        str(Path.home() / ".local/bin/falar"),
+        str(Path.home() / "bin/falar"),
+        "/opt/homebrew/bin/falar",
+        "/usr/local/bin/falar"
+    ]
+    exe = next((p for p in falar_paths if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+    if exe:
+        cmd = [exe, "--interrupt", "--project", "SystemSentinel", "--context", "Agente Externo", message]
+    else:
+        cmd = ["/usr/bin/say", "-v", "Luciana", message]
+    
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def stop_audio_players():
+    try:
+        subprocess.run(["/usr/bin/pkill", "-f", "ffplay.*-nodisp|afplay.*falar|afplay.*kokoro|afplay.*easyvoice"], check=False)
+        subprocess.run(["/usr/bin/killall", "say"], check=False)
+    except Exception:
+        pass
+
+
+# ==============================================================================
+# MCP Protocol Handlers
+# ==============================================================================
+
+TOOLS = [
+    {
+        "name": "get_system_metrics",
+        "description": "Retorna métricas em tempo real do macOS (CPU, memória RAM, Swap, Load Average e nível de alerta).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_active_incidents",
+        "description": "Retorna a lista de incidentes e anomalias ativas detectadas pelo Guardião Proativo do System Sentinel (Docker em crash loop, CPU travada, comandos em loop, etc.).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_system_events",
+        "description": "Retorna o histórico recente de logs e eventos do System Sentinel (anomalias detectadas, resoluções, avisos falados, processos encerrados).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Número máximo de eventos a retornar (padrão 30, máx 100)"
+                }
+            }
+        }
+    },
+    {
+        "name": "list_processes",
+        "description": "Lista os principais processos em execução ordenados por CPU ou memória, com identificador de processos órfãos e ferramentas de build.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sortBy": {
+                    "type": "string",
+                    "enum": ["cpu", "memory", "name"],
+                    "description": "Critério de ordenação (padrão: cpu)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Quantidade máxima de processos (padrão: 15)"
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "Filtro textual opcional pelo nome do processo"
+                }
+            }
+        }
+    },
+    {
+        "name": "resolve_incident",
+        "description": "Resolve ou descarta um incidente ativo detectado pelo Guardião Proativo, opcionalmente executando a ação recomendada (kill/restart/stopDocker).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "incidentId": {
+                    "type": "string",
+                    "description": "UUID do incidente a ser resolvido"
+                },
+                "executeAction": {
+                    "type": "boolean",
+                    "description": "Se verdadeiro, executa a ação corretiva recomendada (reiniciar ou encerrar processo/contêiner)"
+                }
+            },
+            "required": ["incidentId"]
+        }
+    },
+    {
+        "name": "manage_process",
+        "description": "Envia um sinal de encerramento (kill) ou reinício (restart) para um processo pelo PID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "PID do processo no macOS"
+                },
+                "signal": {
+                    "type": "string",
+                    "enum": ["kill", "restart"],
+                    "description": "Ação a executar: 'kill' para encerrar ou 'restart' para tentar reiniciar"
+                }
+            },
+            "required": ["pid"]
+        }
+    },
+    {
+        "name": "set_voice_mute",
+        "description": "Silencia ou reativa os avisos sonoros/voz do System Sentinel, ou interrompe a fala atual imediatamente.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "muted": {
+                    "type": "boolean",
+                    "description": "Verdadeiro para mutar avisos de voz, falso para reativar"
+                },
+                "stopAudioNow": {
+                    "type": "boolean",
+                    "description": "Se verdadeiro, interrompe imediatamente qualquer áudio em reprodução agora"
+                }
+            }
+        }
+    },
+    {
+        "name": "open_settings",
+        "description": "Abre ou fecha a tela de configurações do System Sentinel no painel da barra de menus.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "open": {
+                    "type": "boolean",
+                    "description": "Verdadeiro para abrir a tela de configurações, falso para voltar à tela principal"
+                }
+            }
+        }
+    },
+    {
+        "name": "speak_message",
+        "description": "Anuncia uma mensagem ou resumo sonoro por voz usando o sintetizador configurado (falar / Cartesia Sonic PT-BR).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Texto em português natural a ser falado"
+                }
+            },
+            "required": ["message"]
+        }
+    }
+]
+
+RESOURCES = [
+    {
+        "uri": "systemsentinel://state",
+        "name": "SystemSentinel State",
+        "description": "Estado atual completo do SystemSentinel (métricas, incidentes, status de voz e processos).",
+        "mimeType": "application/json"
+    },
+    {
+        "uri": "systemsentinel://events",
+        "name": "SystemSentinel Event Log",
+        "description": "Registro de eventos e auditoria em JSON Lines do SystemSentinel.",
+        "mimeType": "application/x-jsonlines"
+    }
+]
+
+
+def handle_tool_call(name: str, arguments: dict) -> dict:
+    # 1. get_system_metrics
+    if name == "get_system_metrics":
+        sock_res = query_sentinel_socket({"action": "get_state"})
+        if sock_res and "metrics" in sock_res:
+            data = sock_res["metrics"]
+            data["appStatus"] = "SystemSentinel GUI Ativo"
+            data["isVoiceMuted"] = sock_res.get("isVoiceMuted", False)
+            data["isSpeaking"] = sock_res.get("isSpeaking", False)
+        else:
+            cached = read_cached_state()
+            if cached.get("metrics"):
+                data = cached["metrics"]
+                data["appStatus"] = "SystemSentinel (Cache / Background)"
+            else:
+                data = get_fallback_system_metrics()
+                data["appStatus"] = "Standalone / macOS Direct"
+        return {"content": [{"type": "text", "text": json.dumps(data, indent=2, ensure_ascii=False)}]}
+
+    # 2. get_active_incidents
+    if name == "get_active_incidents":
+        sock_res = query_sentinel_socket({"action": "get_state"})
+        if sock_res and "activeIncidents" in sock_res:
+            incidents = sock_res["activeIncidents"]
+        else:
+            cached = read_cached_state()
+            incidents = cached.get("activeIncidents", [])
+        return {"content": [{"type": "text", "text": json.dumps({"activeIncidents": incidents, "count": len(incidents)}, indent=2, ensure_ascii=False)}]}
+
+    # 3. get_system_events
+    if name == "get_system_events":
+        limit = arguments.get("limit", 30)
+        sock_res = query_sentinel_socket({"action": "get_events", "limit": limit})
+        if sock_res and "events" in sock_res:
+            events = sock_res["events"]
+        else:
+            events = read_recent_events(limit)
+        return {"content": [{"type": "text", "text": json.dumps({"events": events, "count": len(events)}, indent=2, ensure_ascii=False)}]}
+
+    # 4. list_processes
+    if name == "list_processes":
+        sort_by = arguments.get("sortBy", "cpu")
+        limit = arguments.get("limit", 15)
+        flt = arguments.get("filter")
+        sock_res = query_sentinel_socket({"action": "get_processes", "sortBy": sort_by, "limit": limit, "filter": flt})
+        if sock_res and "processes" in sock_res:
+            procs = sock_res["processes"]
+        else:
+            cached = read_cached_state()
+            procs = cached.get("topProcesses", [])
+            if flt:
+                procs = [p for p in procs if flt.lower() in p.get("name", "").lower()]
+            procs = procs[:limit]
+        return {"content": [{"type": "text", "text": json.dumps({"processes": procs, "count": len(procs)}, indent=2, ensure_ascii=False)}]}
+
+    # 5. resolve_incident
+    if name == "resolve_incident":
+        inc_id = arguments.get("incidentId")
+        execute = arguments.get("executeAction", False)
+        sock_res = query_sentinel_socket({"action": "resolve_incident", "id": inc_id, "executeAction": execute})
+        if sock_res:
+            return {"content": [{"type": "text", "text": json.dumps(sock_res, indent=2, ensure_ascii=False)}]}
+        return {"content": [{"type": "text", "text": json.dumps({"status": "warning", "message": "SystemSentinel app não conectado via socket; certifique-se de que o app esteja aberto."}, ensure_ascii=False)}]}
+
+    # 6. manage_process
+    if name == "manage_process":
+        pid = arguments.get("pid")
+        sig = arguments.get("signal", "kill")
+        sock_res = query_sentinel_socket({"action": "manage_process", "pid": pid, "signal": sig})
+        if sock_res:
+            return {"content": [{"type": "text", "text": json.dumps(sock_res, indent=2, ensure_ascii=False)}]}
+        # Fallback local
+        try:
+            if sig == "kill":
+                os.kill(pid, 9)
+                return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "pid": pid, "action": "SIGKILL enviado diretamente"}, ensure_ascii=False)}]}
+            else:
+                return {"content": [{"type": "text", "text": json.dumps({"status": "error", "message": "Restart de processo exige SystemSentinel app ativo."}, ensure_ascii=False)}]}
+        except Exception as e:
+            return {"isError": True, "content": [{"type": "text", "text": f"Falha ao executar ação no PID {pid}: {str(e)}"}]}
+
+    # 7. set_voice_mute
+    if name == "set_voice_mute":
+        muted = arguments.get("muted")
+        stop_now = arguments.get("stopAudioNow", False)
+
+        results = {}
+        if stop_now:
+            sock_res = query_sentinel_socket({"action": "stop_audio"})
+            if not sock_res:
+                stop_audio_players()
+            results["stoppedAudio"] = True
+
+        if muted is not None:
+            sock_res = query_sentinel_socket({"action": "set_voice_mute", "muted": muted})
+            if sock_res:
+                results["isVoiceMuted"] = sock_res.get("isVoiceMuted", muted)
+            else:
+                results["isVoiceMuted"] = muted
+                results["note"] = "Atualizado localmente; sincronizará quando o SystemSentinel abrir."
+
+        return {"content": [{"type": "text", "text": json.dumps({"status": "ok", **results}, indent=2, ensure_ascii=False)}]}
+
+    # 8. open_settings
+    if name == "open_settings":
+        open_val = arguments.get("open", True)
+        act = "open_settings" if open_val else "close_settings"
+        sock_res = query_sentinel_socket({"action": act})
+        if sock_res:
+            return {"content": [{"type": "text", "text": json.dumps(sock_res, indent=2, ensure_ascii=False)}]}
+        return {"content": [{"type": "text", "text": json.dumps({"status": "warning", "message": "SystemSentinel app não conectado via socket."}, ensure_ascii=False)}]}
+
+    # 9. speak_message
+    if name == "speak_message":
+        message = arguments.get("message", "")
+        sock_res = query_sentinel_socket({"action": "speak", "message": message})
+        if sock_res and sock_res.get("status") == "ok":
+            return {"content": [{"type": "text", "text": json.dumps({"status": "ok", "spokenVia": "SystemSentinel App", "message": message}, ensure_ascii=False)}]}
+        
+        ok = execute_falar(message)
+        return {"content": [{"type": "text", "text": json.dumps({"status": "ok" if ok else "error", "spokenVia": "CLI falar fallback", "message": message}, ensure_ascii=False)}]}
+
+    return {"isError": True, "content": [{"type": "text", "text": f"Ferramenta desconhecida: {name}"}]}
+
+
+def handle_resource_read(uri: str) -> dict:
+    if uri == "systemsentinel://state":
+        sock_res = query_sentinel_socket({"action": "get_state"})
+        content = sock_res if sock_res else read_cached_state()
+        return {
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json.dumps(content, indent=2, ensure_ascii=False)
+            }]
+        }
+    elif uri == "systemsentinel://events":
+        if EVENTS_PATH.exists():
+            text = EVENTS_PATH.read_text(encoding="utf-8")
+        else:
+            text = ""
+        return {
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/x-jsonlines",
+                "text": text
+            }]
+        }
+    return {"error": {"code": -32602, "message": f"Recurso não encontrado: {uri}"}}
+
+
+def main():
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+
+            # Suporte para Content-Length framing se enviado
+            if line.startswith("Content-Length:"):
+                length = int(line.split(":")[1].strip())
+                # consome linha em branco
+                sys.stdin.readline()
+                raw_body = sys.stdin.read(length)
+                req = json.loads(raw_body)
+            else:
+                req = json.loads(line)
+
+            req_id = req.get("id")
+            method = req.get("method")
+            params = req.get("params", {})
+
+            if method == "initialize":
+                res = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "tools": {},
+                            "resources": {}
+                        },
+                        "serverInfo": {
+                            "name": "systemsentinel",
+                            "version": "1.0.0"
+                        }
+                    }
+                }
+            elif method == "notifications/initialized" or method == "initialized":
+                # Notificação, sem resposta
+                continue
+            elif method == "ping":
+                res = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+            elif method == "tools/list":
+                res = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "tools": TOOLS
+                    }
+                }
+            elif method == "tools/call":
+                tool_name = params.get("name")
+                tool_args = params.get("arguments", {})
+                tool_result = handle_tool_call(tool_name, tool_args)
+                res = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": tool_result
+                }
+            elif method == "resources/list":
+                res = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "resources": RESOURCES
+                    }
+                }
+            elif method == "resources/read":
+                uri = params.get("uri")
+                res_content = handle_resource_read(uri)
+                if "error" in res_content:
+                    res = {"jsonrpc": "2.0", "id": req_id, "error": res_content["error"]}
+                else:
+                    res = {"jsonrpc": "2.0", "id": req_id, "result": res_content}
+            else:
+                res = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Método não encontrado: {method}"
+                    }
+                }
+
+            out = json.dumps(res, ensure_ascii=False)
+            sys.stdout.write(out + "\n")
+            sys.stdout.flush()
+
+        except (KeyboardInterrupt, SystemExit):
+            break
+        except Exception as e:
+            err_res = {
+                "jsonrpc": "2.0",
+                "id": req.get("id") if "req" in locals() and isinstance(req, dict) else None,
+                "error": {
+                    "code": -32603,
+                    "message": str(e)
+                }
+            }
+            sys.stdout.write(json.dumps(err_res) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

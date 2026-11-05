@@ -1,0 +1,29 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Swift Package Manager & Build
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+
+# Credentials & environment files
+.netrc
+*.env
+*.env.*
+.env
+
+# Agent artifacts and local sessions
+.claude-flow/
+.freebuff/
+.idea/
+.vscode/
+
+# Sockets and logs
+*.sock
+*.log
