@@ -156,9 +156,8 @@ def read_recent_events(limit: int = 30) -> list:
 
 def execute_falar(message: str) -> bool:
     falar_paths = [
-        "/Users/andrerds/bin/falar",
-        str(Path.home() / ".local/bin/falar"),
         str(Path.home() / "bin/falar"),
+        str(Path.home() / ".local/bin/falar"),
         "/opt/homebrew/bin/falar",
         "/usr/local/bin/falar"
     ]

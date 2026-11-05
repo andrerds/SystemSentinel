@@ -26,7 +26,7 @@ System Sentinel é um monitor de integridade de sistema autônomo e de alta prec
 
 ### 3. Sistema de Notificação por Voz Inteligente (`falar`)
 - **Integração com Cartesia Sonic PT-BR:**
-  - Sintetizador ultra-rápido (< 80ms) com motor Cartesia Sonic via script canônico `falar` (`/Users/andrerds/bin/falar`), com fallbacks locais (Kokoro) e nativos (`say -v Luciana`).
+  - Sintetizador ultra-rápido (< 80ms) com motor Cartesia Sonic via script canônico `falar` (`~/bin/falar` ou `~/.local/bin/falar`), com fallbacks locais (Kokoro) e nativos (`say -v Luciana`).
   - Envio com cabeçalho de contexto obrigatório (`--project SystemSentinel --context "Guardião Proativo"`).
   - Suporte à flag `--interrupt`: corta qualquer áudio anterior para não encavalar falas.
 - **Controle Total de Mudo (Mute):**
@@ -53,7 +53,7 @@ O System Sentinel expõe um **Servidor MCP nativo (Model Context Protocol)** em 
                  │ stdio (JSON-RPC 2.0)
                  ▼
 ┌─────────────────────────────────┐
-│      systemsentinel-mcp         │ (/Users/andrerds/bin/systemsentinel-mcp)
+│      systemsentinel-mcp         │ (~/bin/systemsentinel-mcp)
 └────────────────┬────────────────┘
                  │ Unix Domain Socket
                  ▼
@@ -94,18 +94,19 @@ O System Sentinel expõe um **Servidor MCP nativo (Model Context Protocol)** em 
 {
   "mcpServers": {
     "systemsentinel": {
-      "command": "/Users/andrerds/bin/systemsentinel-mcp"
+      "command": "systemsentinel-mcp"
     }
   }
 }
 ```
+*(Ou forneça o caminho absoluto caso não esteja no `$PATH`, ex: `"/Users/<seu-usuario>/.local/bin/systemsentinel-mcp"` ou `"~/bin/systemsentinel-mcp"`)*
 
 ### Antigravity / Gemini CLI (`~/.gemini/settings.json`)
 ```json
 {
   "mcpServers": {
     "systemsentinel": {
-      "command": "/Users/andrerds/bin/systemsentinel-mcp",
+      "command": "systemsentinel-mcp",
       "args": []
     }
   }
@@ -137,11 +138,12 @@ Execute o script de build oficial para compilar em modo Release e empacotar para
 ```
 
 ### Instalar o CLI MCP
-O executável já é instalado em `/Users/andrerds/bin/systemsentinel-mcp`. Para recompilar ou atualizar:
+Copie o executável para uma pasta presente no seu `$PATH` (como `~/.local/bin` ou `~/bin`):
 
 ```bash
-cp bin/systemsentinel-mcp /Users/andrerds/bin/systemsentinel-mcp
-chmod +x /Users/andrerds/bin/systemsentinel-mcp
+mkdir -p ~/.local/bin
+cp bin/systemsentinel-mcp ~/.local/bin/systemsentinel-mcp
+chmod +x ~/.local/bin/systemsentinel-mcp
 ```
 
 ### Iniciar o System Sentinel

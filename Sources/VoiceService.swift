@@ -78,9 +78,8 @@ actor VoiceService {
 
     private static func findFalarExecutable() -> String? {
         let candidates = [
-            "/Users/andrerds/bin/falar",
-            NSString(string: "~/.local/bin/falar").expandingTildeInPath,
             NSString(string: "~/bin/falar").expandingTildeInPath,
+            NSString(string: "~/.local/bin/falar").expandingTildeInPath,
             "/opt/homebrew/bin/falar",
             "/usr/local/bin/falar"
         ]
